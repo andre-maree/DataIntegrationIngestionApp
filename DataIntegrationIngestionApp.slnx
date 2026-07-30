@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="DataIntegrationIngestionApp.AppHost/DataIntegrationIngestionApp.AppHost.csproj" />
+  <Project Path="DataIntegrationIngestionApp/DataIntegrationIngestionApp.csproj" />
+</Solution>
