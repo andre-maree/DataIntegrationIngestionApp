@@ -19,7 +19,7 @@ namespace DataIntegrationIngestionApp;
 /// A failing batch is retried in place (Layer 2 delay + abandon → in-order redelivery)
 /// until it succeeds or reaches MaxDeliveryCount, after which it is dead-lettered.
 /// </summary>
-public class Function1
+public class DataImportQueueTriggerFunction
 {
     private readonly IPayloadReader _payloadReader;
     private readonly IRecordDeserializer _recordDeserializer;
@@ -27,16 +27,16 @@ public class Function1
     private readonly IRetryDelayPolicy _retryDelayPolicy;
     private readonly IngestionOptions _options;
     private readonly TelemetryClient _telemetryClient;
-    private readonly ILogger<Function1> _logger;
+    private readonly ILogger<DataImportQueueTriggerFunction> _logger;
 
-    public Function1(
+    public DataImportQueueTriggerFunction(
         IPayloadReader payloadReader,
         IRecordDeserializer recordDeserializer,
         ISqlBulkInserter bulkInserter,
         IRetryDelayPolicy retryDelayPolicy,
         IOptions<IngestionOptions> options,
         TelemetryClient telemetryClient,
-        ILogger<Function1> logger)
+        ILogger<DataImportQueueTriggerFunction> logger)
     {
         _payloadReader = payloadReader;
         _recordDeserializer = recordDeserializer;
@@ -47,7 +47,7 @@ public class Function1
         _logger = logger;
     }
 
-    [Function(nameof(Function1))]
+    [Function("DataImportQueueTrigger")]
     public async Task Run(
         [ServiceBusTrigger("ingestion-queue", Connection = "ServiceBusConnection", IsSessionsEnabled = true)]
         ServiceBusReceivedMessage message,

@@ -3,6 +3,26 @@
 Backlog of improvements identified during the PoC review. Grouped by theme, roughly in
 priority order. Check items off as they land.
 
+## 0. Upstream design decisions (DO THESE FIRST — block section 1)
+These need to be settled before implementing the generic/dynamic schema, because they
+change what the deserializer and inserter should even produce.
+
+### 0a. Persistence mechanism — is `SqlBulkCopy` still the right tool?
+- [ ] Re-evaluate `SqlBulkCopy` vs. alternatives now that dynamic schema + idempotency
+      are on the roadmap (e.g. bulk-copy-into-staging + `MERGE`, table-valued parameters,
+      `MERGE`/upsert directly, or a bulk library).
+- [ ] Decide based on: idempotency needs, per-table upsert keys, throughput, and how
+      well each option handles a dynamic column set.
+- [ ] Outcome feeds section 1 (dynamic schema) and section 2 (idempotency).
+
+### 0b. Admin-configurable table column mapping
+- [ ] Design a per-table mapping an admin sets up: source (JSON/payload) field ->
+      destination column, plus type / nullable / required info.
+- [ ] Decide where the mapping lives (config file, DB table/registry, blob, etc.) and
+      how it is loaded / cached / refreshed at runtime.
+- [ ] Decide precedence: admin mapping vs. reflecting the live SQL table schema.
+- [ ] Consider validation, defaults, unknown-column handling, and mapping versioning.
+
 ## 1. Dynamic / generic schema (make ingestion table-agnostic)
 Currently the pipeline is `Contact`-specific despite the "any `SessionId` table" design.
 
