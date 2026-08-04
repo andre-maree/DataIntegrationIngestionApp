@@ -58,7 +58,6 @@ Non-transient errors (bad payload / validation) currently retry the full
 	  of retrying like a transient SQL fault.
 
 ## 5. Cleanups / polish
-- [ ] Rename `Function1` to something descriptive (e.g. `IngestionFunction`).
 - [ ] Reconsider `SqlBulkCopy` `BulkCopyTimeout = 0` (no timeout can hang under contention).
 - [ ] Add a "PoC scope & limitations" note to `README.md` (points 1–4 above).
 - [ ] Add unit tests around the injected services (`IPayloadReader`,
