@@ -2,7 +2,7 @@
 
 ## Context & Findings
 Current state:
-- `DataImportQueueTriggerFunction` — isolated-worker Service Bus trigger on queue `ingestion-queue`, `Connection = ""`. Logs and completes only. **No sessions yet.**
+- `Function1.cs` — isolated-worker Service Bus trigger on queue `ingestion-queue`, `Connection = ""`. Logs and completes only. **No sessions yet.**
 - `Program.cs` — minimal isolated-worker host with App Insights already wired (`AddApplicationInsightsTelemetryWorkerService` + `ConfigureFunctionsApplicationInsights`), no other DI.
 - `.csproj` — .NET 8, isolated worker (`Microsoft.Azure.Functions.Worker` 2.51.0), Service Bus extension 5.22.2. No blob/SQL/Aspire packages.
 - No Aspire AppHost project in the `.slnx` solution — net-new.
@@ -11,8 +11,8 @@ Current state:
 - **Inline vs blob**: distinguished by `message.ContentType` (`application/json` = inline; `application/vnd.ingestion.blobref+json` = blob reference).
 - **Payload format**: JSON array of records.
 - **Aspire scope**: Service Bus emulator only for now; blob + SQL via config.
-- **FIFO requirement**: **Service Bus Sessions, one session per SQL table.** `SessionId` = **schema-qualified table name** (e.g. `dbo.Contacts`). Strict, absolute FIFO — later batches for a tabl[...]
-- **Long-term failure handling**: **block the session and retry the failing batch in place** (abandon → in-order redelivery). Retries continue up to **`MaxDeliveryCount`**, then the batch is dea[...]
+- **FIFO requirement**: **Service Bus Sessions, one session per SQL table.** `SessionId` = **schema-qualified table name** (e.g. `dbo.Contacts`). Strict, absolute FIFO — later batches for a table never process before an earlier failed batch.
+- **Long-term failure handling**: **block the session and retry the failing batch in place** (abandon → in-order redelivery). Retries continue up to **`MaxDeliveryCount`**, then the batch is dead-lettered. `MaxDeliveryCount` is **configurable, default 10**.
 - **Short-term transient retries**: **`Microsoft.Data.SqlClient` built-in transient retry** (no Polly, no extra package).
 - **Observability**: **basic App Insights alerting** (custom events/metrics + error telemetry) for failed batches, abandons/redeliveries, stalled sessions, and dead-letters.
 - **Target SQL table (dev)**: `DemoDatabase.dbo.Contacts` — `Id INT NOT NULL`, `Name NVARCHAR(50) NOT NULL`, `Surname NVARCHAR(50) NOT NULL`, `Age INT NULL`, `Email NVARCHAR(320) NULL`.
@@ -20,9 +20,9 @@ Current state:
 ## Retry Architecture (final)
 Three cooperating layers, all preserving strict FIFO because a single session consumer processes one batch at a time and never advances past a failing batch:
 
-1. **Layer 1 — SqlClient built-in transient retry (seconds).** Configure `SqlConnection` with a retry logic provider (`SqlRetryLogicOption`: retry count, delay, transient error numbers) so deadl[...]
-2. **Layer 2 — bounded in-process delayed retry before releasing (throttle).** If Layer 1 still fails, apply a capped exponential backoff wait (grows to a configurable max, e.g. ~5 min) while th[...]
-3. **Layer 3 — abandon → in-order redelivery, capped by `MaxDeliveryCount`.** After the delay, **abandon** the message. Because the queue is session-enabled, Service Bus redelivers the **same*...]
+1. **Layer 1 — SqlClient built-in transient retry (seconds).** Configure `SqlConnection` with a retry logic provider (`SqlRetryLogicOption`: retry count, delay, transient error numbers) so deadlocks/timeouts/dropped connections retry inside the invocation without touching the broker.
+2. **Layer 2 — bounded in-process delayed retry before releasing (throttle).** If Layer 1 still fails, apply a capped exponential backoff wait (grows to a configurable max, e.g. ~5 min) while the Functions binding **auto-renews the session lock**. Prevents hot-looping/hammering SQL between deliveries.
+3. **Layer 3 — abandon → in-order redelivery, capped by `MaxDeliveryCount`.** After the delay, **abandon** the message. Because the queue is session-enabled, Service Bus redelivers the **same** message first, preserving order. `DeliveryCount` increments each time; once it reaches **`MaxDeliveryCount` (configurable, default 10)** the batch is **dead-lettered** (either broker auto-DLQ or explicit `DeadLetterMessageAsync` with reason), and an App Insights error/alert is emitted.
 
 Rationale note: scheduled re-enqueue with backoff was rejected because completing + re-enqueuing a failed batch lets later batches jump ahead, violating strict per-table FIFO.
 
@@ -34,7 +34,7 @@ Rationale note: scheduled re-enqueue with backoff was rejected because completin
   - `TrackException` on failures with session/table dimensions.
   - `TrackEvent("BatchDeadLettered", ...)` when `MaxDeliveryCount` reached.
   - Optional `TrackMetric("SessionRetryDepth", DeliveryCount)` to surface stalled sessions.
-- Portal-side alert rules to create: (1) exceptions on the function, (2) `BatchDeadLettered` custom-event count > 0, (3) high `SessionRetryDepth`. Actual Azure alert resources are portal/IaC confi[...]
+- Portal-side alert rules to create: (1) exceptions on the function, (2) `BatchDeadLettered` custom-event count > 0, (3) high `SessionRetryDepth`. Actual Azure alert resources are portal/IaC config, not app code.
 
 ## Design
 - **Models/`Contact.cs`**: maps to `dbo.Contacts` (`int Id`, `string Name`, `string Surname`, `int? Age`, `string? Email`).
@@ -42,14 +42,14 @@ Rationale note: scheduled re-enqueue with backoff was rejected because completin
 - **Services/**:
   - `IPayloadReader` / `PayloadReader` — returns raw JSON string; inline from `message.Body`, blob-ref via `BlobServiceClient` (config `BlobStorage`).
   - `IRecordDeserializer` — `System.Text.Json` deserialize JSON array → `List<Contact>` (case-insensitive, validates required `Id`/`Name`/`Surname`).
-  - `ISqlBulkInserter` / `SqlBulkInserter` — builds `DataTable` (`Id, Name, Surname, Age, Email`), `SqlBulkCopy` into destination table (from `SessionId`) within a transaction; `SqlConnection` c[...]
+  - `ISqlBulkInserter` / `SqlBulkInserter` — builds `DataTable` (`Id, Name, Surname, Age, Email`), `SqlBulkCopy` into destination table (from `SessionId`) within a transaction; `SqlConnection` configured with SqlClient built-in retry provider (Layer 1).
   - `IRetryDelayPolicy` — capped exponential backoff from `DeliveryCount` (Layer 2).
-- **The session-enabled Service Bus trigger function**: `[ServiceBusTrigger("ingestion-queue", Connection = "ServiceBusConnection", IsSessionsEnabled = true)]`. Read `SessionId` (= table); route payload (inline/blob ...]
+- **Function1** (sessions enabled): `[ServiceBusTrigger("ingestion-queue", Connection = "ServiceBusConnection", IsSessionsEnabled = true)]`. Read `SessionId` (= table); route payload (inline/blob by ContentType); deserialize; bulk-insert. On success → `CompleteMessageAsync` + success telemetry. On failure → emit telemetry, if `DeliveryCount < MaxDeliveryCount` apply Layer 2 delay then `AbandonMessageAsync`; else `DeadLetterMessageAsync` + error/alert telemetry.
 - **Content-type constants + classifier** for inline vs blob-reference.
 
 ## Session / Broker configuration
 - Queue `ingestion-queue`: **`RequiresSession = true`**, `MaxDeliveryCount` set from the same configurable value (default 10).
-- `host.json` `extensions.serviceBus`: `sessionIdleTimeout`, `maxConcurrentSessions`, `maxAutoLockRenewalDuration` (≥ worst-case Layer 1 + Layer 2 time), prefetch/one-at-a-time to guarantee orde[...]
+- `host.json` `extensions.serviceBus`: `sessionIdleTimeout`, `maxConcurrentSessions`, `maxAutoLockRenewalDuration` (≥ worst-case Layer 1 + Layer 2 time), prefetch/one-at-a-time to guarantee order.
 - **Producers** (not built here) must set `SessionId = <schema.table>` and `ContentType` — documented.
 
 ## Packages to add
@@ -61,11 +61,11 @@ Rationale note: scheduled re-enqueue with backoff was rejected because completin
 - `local.settings.json`: `ServiceBusConnection`, `SqlConnection` (DemoDatabase), `BlobStorage`, `Ingestion:MaxDeliveryCount` (10), Layer 1/Layer 2 retry tuning, App Insights connection string.
 
 ## Aspire (Service Bus emulator only, session-enabled)
-- New `DataIntegrationIngestionApp.AppHost` referencing `Aspire.Hosting.Azure.ServiceBus`; `AddAzureServiceBus(...).RunAsEmulator()` with queue `ingestion-queue` configured **`RequiresSession = tr...]
+- New `DataIntegrationIngestionApp.AppHost` referencing `Aspire.Hosting.Azure.ServiceBus`; `AddAzureServiceBus(...).RunAsEmulator()` with queue `ingestion-queue` configured **`RequiresSession = true`** and `MaxDeliveryCount = 10` (configurable); reference the Functions project so the emulator connection string is injected as `ServiceBusConnection`. Register AppHost in `.slnx`.
 
 ## Risks / Open Items
-- With `MaxDeliveryCount = 10`, a persistently-failing batch dead-letters after 10 in-order redeliveries — while stalled it blocks only its table's session (intentional strict FIFO). Ensure the [...]
-- `maxAutoLockRenewalDuration` must exceed worst-case single-attempt time (Layer 1 + Layer 2 delay) or the lock is lost and the batch redelivers early (still ordered, but wasted work + faster Deli[...]
+- With `MaxDeliveryCount = 10`, a persistently-failing batch dead-letters after 10 in-order redeliveries — while stalled it blocks only its table's session (intentional strict FIFO). Ensure the documented DLQ/exception alerts are actually created in the portal.
+- `maxAutoLockRenewalDuration` must exceed worst-case single-attempt time (Layer 1 + Layer 2 delay) or the lock is lost and the batch redelivers early (still ordered, but wasted work + faster DeliveryCount burn).
 - `Id` is `NOT NULL`, non-identity — payload must supply `Id`.
 - Blob reading needs Azurite/storage locally; supplied via `BlobStorage` config since Aspire is Service Bus-only.
 - Verify the Service Bus emulator supports session-enabled queues in the current tooling.
@@ -77,13 +77,13 @@ Rationale note: scheduled re-enqueue with backoff was rejected because completin
 3. Create `Options/IngestionOptions.cs` — configurable `MaxDeliveryCount` (default 10), Layer 1 retry settings, Layer 2 backoff cap; bind from configuration.
 4. Create `Services/IPayloadReader.cs` + `PayloadReader.cs` — return raw JSON string; inline from `message.Body`, blob-ref via `BlobServiceClient`.
 5. Create `Services/IRecordDeserializer.cs` + `RecordDeserializer.cs` — deserialize JSON array into `List<Contact>` with case-insensitive matching and required-field validation.
-6. Create `Services/ISqlBulkInserter.cs` + `SqlBulkInserter.cs` — build `DataTable`, `SqlBulkCopy` into destination table (from `SessionId`) within a transaction; configure `SqlConnection` with [...]
+6. Create `Services/ISqlBulkInserter.cs` + `SqlBulkInserter.cs` — build `DataTable`, `SqlBulkCopy` into destination table (from `SessionId`) within a transaction; configure `SqlConnection` with `SqlRetryLogicOption` built-in transient retry (Layer 1).
 7. Create `Services/IRetryDelayPolicy.cs` + implementation — capped exponential backoff from `DeliveryCount` (Layer 2).
 8. Define content-type constants (inline vs blob-reference) + classifier helper.
-9. Create/update the session-enabled Service Bus ingestion function — implement a Service Bus trigger with `IsSessionsEnabled = true` and `Connection = "ServiceBusConnection"`; read `SessionId` as the target table; route → deserialize → bulk insert; success completes; failure emits the retry/dead-letter signals described above.
+9. Rewrite `Function1.cs` — `IsSessionsEnabled = true`, `Connection = "ServiceBusConnection"`; `SessionId` → target table; route → deserialize → bulk insert; success completes; failure emits telemetry, abandons with Layer 2 delay while `DeliveryCount < MaxDeliveryCount`, else dead-letters; inject `TelemetryClient`/`ILogger` for App Insights events (ingested, retry-scheduled, dead-lettered, exceptions).
 10. Register services, `BlobServiceClient`, `IngestionOptions`, and SQL retry options in `Program.cs` DI; bind connections + retry tuning from configuration (App Insights already registered).
 11. Add/adjust `host.json` — `extensions.serviceBus` session settings (`maxConcurrentSessions`, `sessionIdleTimeout`, `maxAutoLockRenewalDuration`, one-at-a-time prefetch).
 12. Add `local.settings.json` entries — `ServiceBusConnection`, `SqlConnection` (DemoDatabase), `BlobStorage`, `Ingestion:MaxDeliveryCount=10`, retry tuning, App Insights connection string.
-13. Create `DataIntegrationIngestionApp.AppHost` with `Aspire.Hosting.Azure.ServiceBus`; `RunAsEmulator()` with `ingestion-queue` session-enabled (`RequiresSession = true`, `MaxDeliveryCount = 10`...]
+13. Create `DataIntegrationIngestionApp.AppHost` with `Aspire.Hosting.Azure.ServiceBus`; `RunAsEmulator()` with `ingestion-queue` session-enabled (`RequiresSession = true`, `MaxDeliveryCount = 10`); reference Functions project; add AppHost to `.slnx`.
 14. Document App Insights alert rules to create in the portal (function exceptions, `BatchDeadLettered` count, high `SessionRetryDepth`).
 15. Provide sample messages (inline Contacts JSON array and a blob-reference message) each with `SessionId = "dbo.Contacts"` for local FIFO end-to-end testing.
