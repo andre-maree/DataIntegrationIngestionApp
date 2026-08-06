@@ -1,4 +1,10 @@
 <Solution>
+  <Folder Name="/Solution Items/">
+    <File Path="docs/IngestionPlan.md" />
+    <File Path="README.md" />
+    <File Path="TODO.md" />
+  </Folder>
   <Project Path="DataIntegrationIngestionApp.AppHost/DataIntegrationIngestionApp.AppHost.csproj" />
   <Project Path="DataIntegrationIngestionApp/DataIntegrationIngestionApp.csproj" />
+  <Project Path="SendTestMessage/SendTestMessage.csproj" />
 </Solution>

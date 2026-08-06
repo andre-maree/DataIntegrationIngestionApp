@@ -8,7 +8,7 @@ EnsureFuncOnPath();
 // The resource is named "ServiceBusConnection" so the Functions Service Bus trigger
 // (Connection = "ServiceBusConnection") resolves the injected connection string.
 var serviceBus = builder.AddAzureServiceBus("ServiceBusConnection")
-    .RunAsEmulator();
+    .RunAsEmulator(emulator => emulator.WithHostPort(59234));
 
 // Session-enabled queue so batches are processed strictly FIFO per SQL table (SessionId).
 serviceBus.AddServiceBusQueue("ingestion-queue")
@@ -23,6 +23,7 @@ serviceBus.AddServiceBusQueue("ingestion-queue")
 // execution path (queue message -> bulk insert) can be tested without any external SQL.
 var demoDatabase = builder.AddSqlServer("sql")
     .WithLifetime(ContainerLifetime.Persistent)
+    .WithHostPort(1433)
     .AddDatabase("DemoDatabase")
     .WithCreationScript(File.ReadAllText(
         Path.Combine(builder.AppHostDirectory, "sql", "init-contacts.sql")));
